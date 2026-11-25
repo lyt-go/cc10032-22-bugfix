@@ -94,5 +94,31 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
-    return ActionResult(ok=entry is not None, message=message, entry=entry)
+    payload_data = payload.model_dump()
+    params = dict(payload_data.get("params") or {})
+    for key, value in payload_data.items():
+        if key not in {"action", "remark", "params"}:
+            params.setdefault(key, value)
+
+    result, message = service.run_action(entry_id, payload.action.strip(), **params)
+    ok = bool(result.get("ok", result is not None)) if isinstance(result, dict) else result is not None
+
+    # 普通状态动作返回资源行；富领域动作的完整结论放到顶层和 result，
+    # 同时保持 entry 为资源详情，兼容现有 ActionResult 契约。
+    resource_entry = service.get_entry(entry_id)
+    if isinstance(result, dict) and ("current_offset" in result or "committed_offset" in result or "send_id" in result):
+        entry_payload = resource_entry
+        extra = {
+            key: value for key, value in result.items()
+            if key not in {"ok", "message", "entry"} and isinstance(key, str)
+        }
+        extra["result"] = result
+    else:
+        entry_payload = result
+        extra = {}
+        if isinstance(result, dict):
+            extra = {
+                key: value for key, value in result.items()
+                if key not in {"ok", "message", "entry"} and isinstance(key, str)
+            }
+    return ActionResult(ok=ok, message=message, entry=entry_payload, **extra)

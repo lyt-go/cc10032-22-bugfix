@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.progress import normalize_progress, recompute_contiguous_progress
 from app.store import store
 
 
@@ -81,11 +82,36 @@ class StreamSourceService(BaseModuleService):
             except Exception:
                 dirty.append({"row": i, "issue": f"反序列化失败: 格式 {deser} 不兼容消息 {raw_payload}"})
 
-        # 更新水位偏移
+        # 采样只登记观测事件，不把事件时间写成 offset，也不凭空推进已确认位点。
         if samples:
-            # 最后一个样本的时间戳作为当前水位
-            last_ts = max(s.get("ts", 0) for s in samples)
-            store.update_watermark(str(source_id), {"offset": last_ts, "source": entry.get("源标识"), "ts": time.time()})
+            partition = str(source_id)
+            state = normalize_progress(partition, store.get_watermark(partition) or {})
+            recompute_contiguous_progress(state)
+            committed_offset = state["committed_offset"]
+            next_offset = int(committed_offset) + 1
+
+            for sample in samples:
+                sample["offset"] = next_offset
+                sample["event_time"] = sample.get("ts")
+                sample["confirmed"] = False
+                key = str(next_offset)
+                state["events"][key] = {
+                    "offset": next_offset,
+                    "event_time": sample.get("ts"),
+                    "event": sample,
+                    "status": "sampled",
+                    "confirmed": False,
+                    "sampled_at": time.time(),
+                }
+                next_offset += 1
+
+            recompute_contiguous_progress(state)
+            state["offset"] = committed_offset
+            state["committed_offset"] = committed_offset
+            state["sampled_events"] = samples
+            state["source"] = entry.get("源标识")
+            state["ts"] = time.time()
+            store.update_watermark(partition, state)
 
         # 产生流水线制品
         batch_id = f"STREAM_{source_id}_{int(time.time())}"

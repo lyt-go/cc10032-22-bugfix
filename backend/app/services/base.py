@@ -17,6 +17,7 @@ class BaseModuleService:
     REQUIRED_FIELDS: list[str] = []
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
+    ACTION_HANDLER_ALIASES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
 
     # ---- 跨模块流水线元信息 ----
@@ -70,17 +71,31 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(self, entry_id: int, action: str, **params: Any) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
         target = self.ACTION_RULES.get(action)
-        if target is None:
-            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
-        entry["status"] = target
-        entry["pending"] = target != self.STATUS_ORDER[-1]
-        entry["abnormal"] = action in self.NEGATIVE_ACTIONS
-        return entry, f"{self.ENTITY}已{action}"
+        if target is not None:
+            entry["status"] = target
+            entry["pending"] = target != self.STATUS_ORDER[-1]
+            entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+            return entry, f"{self.ENTITY}已{action}"
+
+        handler_name = self.ACTION_HANDLER_ALIASES.get(action, action)
+        handler = getattr(self, handler_name, None) if isinstance(handler_name, str) else None
+        if callable(handler) and not action.startswith("_"):
+            blocked = {"run_action", "list_entries", "create_entry", "get_entry"}
+            if handler_name not in blocked:
+                try:
+                    result = handler(entry_id, **params)
+                except TypeError:
+                    result = handler(**params)
+                if isinstance(result, dict):
+                    message = str(result.get("message") or result.get("reason") or f"{self.ENTITY}动作 {action} 已执行")
+                    return result, message
+
+        return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

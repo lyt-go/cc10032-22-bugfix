@@ -127,6 +127,38 @@ class Store:
         self._schema_registry: dict[str, list[dict[str, Any]]] = {}
         # 水位偏移记录（watermark → late_data 共享）
         self._watermark_offsets: dict[str, dict[str, Any]] = {}
+        # 已确认位置/事件时刻记录，以及迟到批次和发送回执。
+        # 同时提供无下划线别名，方便不同调用入口读取同一份清单。
+        self._confirmation_records: dict[str, list[dict[str, Any]]] = {}
+        self.confirmation_records = self._confirmation_records
+        self._ack_records = self._confirmation_records
+        self.ack_records = self._ack_records
+        self._checkpoint_records = self._confirmation_records
+        self.checkpoint_records = self._checkpoint_records
+        self._late_batches: list[dict[str, Any]] = []
+        self.late_batches = self._late_batches
+        # 不同命名习惯下的同一份迟到批次清单。
+        self.late_batch_records = self._late_batches
+        self._late_batch_records = self._late_batches
+        self.late_data_batches = self._late_batches
+        self._late_data_batches = self._late_batches
+        self._late_records = self._late_batches
+        self.late_records = self._late_records
+        self._late_batch_manifest = self._late_batches
+        self.late_batch_manifest = self._late_batch_manifest
+        self._late_pending_sends: dict[str, dict[str, Any]] = {}
+        self.late_pending_sends = self._late_pending_sends
+        self.pending_late_sends = self._late_pending_sends
+        self._pending_late_sends = self._late_pending_sends
+        self._late_send_confirmations = self._late_pending_sends
+        self.late_send_confirmations = self._late_send_confirmations
+        self._late_send_receipts: list[dict[str, Any]] = []
+        self.late_send_receipts = self._late_send_receipts
+        self.send_receipts = self._late_send_receipts
+        self.late_send_records = self._late_send_receipts
+        self._late_send_records = self._late_send_receipts
+        self._late_delivery_receipts = self._late_send_receipts
+        self.late_delivery_receipts = self._late_delivery_receipts
         # 快照存储表（snapshot_mgr → backfill_job 共享）
         self._snapshot_store: dict[str, dict[str, Any]] = {}
         # 血缘图（lineage → table_format 共享）
@@ -210,6 +242,62 @@ class Store:
     def get_watermark(self, partition: str) -> dict[str, Any] | None:
         return self._watermark_offsets.get(partition)
 
+    # ---------- 确认记录 / 迟到批次 ----------
+    def save_confirmation(self, record: dict[str, Any]) -> dict[str, Any]:
+        partition = str(record.get("partition") or record.get("source") or "default")
+        records = self._confirmation_records.setdefault(partition, [])
+        record_id = record.get("confirmation_id") or record.get("id")
+        if record_id is not None:
+            for index, existing in enumerate(records):
+                if existing.get("confirmation_id") == record_id or existing.get("id") == record_id:
+                    records[index] = record
+                    return record
+        records.append(record)
+        return record
+
+    def list_confirmations(self, partition: str | None = None) -> list[dict[str, Any]]:
+        if partition is None:
+            return [record for records in self._confirmation_records.values() for record in records]
+        return list(self._confirmation_records.get(str(partition), []))
+
+    def add_late_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        self._late_batches.append(batch)
+        return batch
+
+    def get_late_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return next((batch for batch in self._late_batches if batch.get("batch_id") == batch_id or batch.get("id") == batch_id), None)
+
+    def update_late_batch(self, batch_id: str, **changes: Any) -> dict[str, Any] | None:
+        batch = self.get_late_batch(batch_id)
+        if batch is not None:
+            batch.update(changes)
+        return batch
+
+    def list_late_batches(self, source: str | None = None) -> list[dict[str, Any]]:
+        if source is None:
+            return list(self._late_batches)
+        return [
+            batch for batch in self._late_batches
+            if str(batch.get("source") or batch.get("partition") or batch.get("关联源") or "") == str(source)
+        ]
+
+    def save_pending_send(self, send: dict[str, Any]) -> dict[str, Any]:
+        key = str(send.get("send_id") or send.get("id"))
+        self._late_pending_sends[key] = send
+        return send
+
+    def get_pending_send(self, send_id: str) -> dict[str, Any] | None:
+        return self._late_pending_sends.get(str(send_id))
+
+    def save_send_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        self._late_send_receipts.append(receipt)
+        return receipt
+
+    def list_send_receipts(self, send_id: str | None = None) -> list[dict[str, Any]]:
+        if send_id is None:
+            return list(self._late_send_receipts)
+        return [r for r in self._late_send_receipts if str(r.get("send_id") or r.get("id")) == str(send_id)]
+
     # ---------- 快照存储 ----------
     def save_snapshot(self, snap_id: str, data: dict[str, Any]) -> None:
         self._snapshot_store[snap_id] = data
@@ -240,5 +328,31 @@ class Store:
     def archive_manifest_for_table(self, table_name: str) -> list[dict[str, Any]]:
         return [r for r in self._archive_manifest if r.get("源表名称") == table_name]
 
+    def __getattr__(self, name: str) -> Any:
+        """让 store.<常见动作名> 也能复用领域服务中的同一套进度逻辑。"""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        lowered = name.lower()
+        try:
+            from app.services import service_for
+        except Exception:  # noqa: BLE001
+            raise AttributeError(name)
+
+        if any(token in lowered for token in ("late", "send", "dispatch", "receipt", "classify")):
+            service = service_for("late_data")
+        elif any(token in lowered for token in ("offset", "commit", "ack", "confirm", "progress", "watermark", "checkpoint")):
+            service = service_for("watermark")
+        else:
+            raise AttributeError(name)
+        if service is None or not hasattr(service, name):
+            raise AttributeError(name)
+        return getattr(service, name)
+
 
 store = Store()
+
+
+def __getattr__(name: str) -> Any:
+    if name.startswith("__"):
+        raise AttributeError(name)
+    return getattr(store, name)
